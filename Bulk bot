@@ -1,0 +1,152 @@
+import websocket
+import json
+import time
+import numpy as np
+
+# ================= CONFIG =================
+API_TOKEN = "PUT_API_TOKEN_HERE"
+APP_ID = "1089"
+
+SYMBOL = "R_100"
+BASE_STAKE = 1
+MAX_STAKE = 50
+TRADE_BATCH = 5          # bulk trades per signal
+DURATION = 1             # ticks
+CONTRACT_EVEN = "DIGITEVEN"
+CONTRACT_ODD = "DIGITODD"
+
+USE_MARTINGALE = True
+MARTINGALE_MULTIPLIER = 2
+
+DAILY_STOP_LOSS = 20
+DAILY_TAKE_PROFIT = 30
+COOLDOWN_AFTER_LOSS = 10  # seconds
+
+RSI_PERIOD = 14
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 30
+
+# =========================================
+
+ticks = []
+current_stake = BASE_STAKE
+profit = 0
+losses = 0
+
+# ---------- INDICATORS ----------
+def calculate_rsi(data, period=14):
+    if len(data) < period:
+        return None
+    deltas = np.diff(data)
+    gain = np.mean([d for d in deltas if d > 0] or [0])
+    loss = abs(np.mean([d for d in deltas if d < 0] or [0]))
+    rs = gain / loss if loss != 0 else 0
+    return 100 - (100 / (1 + rs))
+
+def trend_direction(data):
+    if len(data) < 10:
+        return None
+    return "UP" if data[-1] > data[-10] else "DOWN"
+
+# ---------- TRADE ----------
+def place_trade(ws, contract_type):
+    global current_stake
+    stake = min(current_stake, MAX_STAKE)
+
+    ws.send(json.dumps({
+        "buy": 1,
+        "price": stake,
+        "parameters": {
+            "amount": stake,
+            "basis": "stake",
+            "contract_type": contract_type,
+            "currency": "USD",
+            "duration": DURATION,
+            "duration_unit": "t",
+            "symbol": SYMBOL
+        }
+    }))
+
+def bulk_trade(ws, contract_type):
+    print(f"\nPlacing {TRADE_BATCH} BULK trades → {contract_type}")
+    for _ in range(TRADE_BATCH):
+        place_trade(ws, contract_type)
+        time.sleep(0.4)
+
+# ---------- WS EVENTS ----------
+def on_open(ws):
+    ws.send(json.dumps({"authorize": API_TOKEN}))
+
+def on_message(ws, message):
+    global current_stake, profit, losses
+
+    data = json.loads(message)
+
+    if "authorize" in data:
+        print("Authorized ✅")
+        ws.send(json.dumps({
+            "ticks": SYMBOL,
+            "subscribe": 1
+        }))
+
+    if "tick" in data:
+        price = int(str(data["tick"]["quote"])[-1])
+        ticks.append(price)
+        if len(ticks) > 100:
+            ticks.pop(0)
+
+        rsi = calculate_rsi(ticks)
+        trend = trend_direction(ticks)
+
+        if rsi is None or trend is None:
+            return
+
+        # ---------- STRATEGY ----------
+        if rsi < RSI_OVERSOLD and trend == "UP":
+            bulk_trade(ws, CONTRACT_EVEN)
+
+        elif rsi > RSI_OVERBOUGHT and trend == "DOWN":
+            bulk_trade(ws, CONTRACT_ODD)
+
+    if "buy" in data:
+        print("Trade placed:", data["buy"]["contract_id"])
+
+    if "proposal_open_contract" in data:
+        poc = data["proposal_open_contract"]
+        if poc["is_sold"]:
+            pl = poc["profit"]
+            profit += pl
+
+            if pl < 0:
+                losses += abs(pl)
+                print("LOSS:", pl)
+                if USE_MARTINGALE:
+                    current_stake *= MARTINGALE_MULTIPLIER
+                print("Cooldown...")
+                time.sleep(COOLDOWN_AFTER_LOSS)
+            else:
+                print("WIN:", pl)
+                current_stake = BASE_STAKE
+
+            print("TOTAL PROFIT:", profit)
+
+            if losses >= DAILY_STOP_LOSS:
+                print("STOP LOSS HIT ❌")
+                ws.close()
+
+            if profit >= DAILY_TAKE_PROFIT:
+                print("TAKE PROFIT HIT ✅")
+                ws.close()
+
+def on_error(ws, error):
+    print("Error:", error)
+
+# ---------- START ----------
+ws = websocket.WebSocketApp(
+    f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}",
+    on_open=on_open,
+    on_message=on_message,
+    on_error=on_error
+)
+
+ws.run_forever()
